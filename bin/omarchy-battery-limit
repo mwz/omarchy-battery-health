@@ -16,7 +16,7 @@ esac
 
 status_unavailable() {
   if [[ $action == status && $shell_output == true ]]; then
-    printf 'state\tunavailable\npolicy\tunknown\n'
+    printf 'state\tunavailable\npolicy\tunknown\naccess\tunknown\n'
   fi
   echo "Battery protection status unavailable" >&2
   exit 1
@@ -32,9 +32,110 @@ upower_property() {
       ;;
     *)
       [[ $raw =~ ^u\ ([0-9]+)$ ]] || return 1
+      [[ ${#BASH_REMATCH[1]} -le 10 ]] && (( 10#${BASH_REMATCH[1]} <= 4294967295 )) || return 1
       ;;
   esac
   printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# Polkit answers whether this session can request a change, not whether the
+# firmware will accept it. Never prompt during status polling. Include the
+# process start time and UID so pkcheck cannot mistake a reused PID for us.
+check_access() {
+  local stat_line result
+  local -a stat_fields
+  access=unknown
+  IFS= read -r stat_line < "/proc/$$/stat" || return
+  read -r -a stat_fields <<< "${stat_line##*) }"
+  [[ ${stat_fields[19]} =~ ^[0-9]+$ ]] || return
+  auth_subject="$$,${stat_fields[19]},$UID"
+
+  timeout 5s pkcheck --action-id org.freedesktop.UPower.enable-charging-limit \
+    --process "$auth_subject" >/dev/null 2>&1
+  result=$?
+  case "$result" in
+    0) access=allowed ;;
+    1) access=denied ;;
+    2) access=challenge ;;
+  esac
+}
+
+# Driver and entry names vary; use the shared firmware-attributes fields.
+# Only a positive result supports the hint. Missing or unreadable attributes
+# are inconclusive, and a password is never treated as proof of a charging lock.
+bios_admin_password_enabled() {
+  local entry role mechanism enabled
+  for entry in /sys/class/firmware-attributes/*/authentication/*; do
+    [[ -d $entry ]] || continue
+    role=$(cat "$entry/role" 2>/dev/null) || continue
+    [[ $role == bios-admin ]] || continue
+    mechanism=$(cat "$entry/mechanism" 2>/dev/null) || continue
+    [[ $mechanism == password ]] || continue
+    enabled=$(cat "$entry/is_enabled" 2>/dev/null) || continue
+    [[ $enabled == 1 ]] && return 0
+  done
+  return 1
+}
+
+percentage() {
+  [[ $1 =~ ^(0|[1-9][0-9]?|100)$ ]]
+}
+
+# UPower's enabled flag can disagree with firmware after a failed write or
+# startup restore. Prefer readable, standard kernel controls when their
+# meaning is known. These reads never test access by writing to the battery.
+# Missing interfaces leave UPower as the fallback; an unfamiliar active mode
+# is explicitly unknown rather than guessed to be off.
+read_kernel_policy() {
+  local raw native battery types mode start end
+  kernel_state=unknown
+  kernel_policy=unknown
+  raw=$(busctl get-property org.freedesktop.UPower "$1" org.freedesktop.UPower.Device NativePath 2>/dev/null) || return 1
+  [[ $raw =~ ^s\ \"([a-zA-Z0-9_./:@-]+)\"$ ]] || return 1
+  native=${BASH_REMATCH[1]}
+  [[ $native != */* || $native == /sys/*/power_supply/* ]] || return 1
+  native=${native##*/}
+  [[ $native =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+  battery="/sys/class/power_supply/$native"
+  [[ $(cat "$battery/type" 2>/dev/null) == Battery ]] || return 1
+
+  types=$(cat "$battery/charge_types" 2>/dev/null) || types=
+  if [[ $types =~ \[([^][]+)\] ]]; then
+    mode=${BASH_REMATCH[1]}
+  elif [[ -n $types ]]; then
+    return 0
+  else
+    mode=$(cat "$battery/charge_type" 2>/dev/null) || mode=
+  fi
+
+  case "$mode" in
+    Standard | Fast) kernel_state=disabled; return 0 ;;
+    Long_Life | "Long Life" | Trickle)
+      kernel_state=enabled; kernel_policy=firmware; return 0 ;;
+    Custom | "") ;;
+    *) return 0 ;;
+  esac
+
+  start=$(cat "$battery/charge_control_start_threshold" 2>/dev/null) || start=
+  end=$(cat "$battery/charge_control_end_threshold" 2>/dev/null) || end=
+  [[ -n $mode || -n $start || -n $end ]] || return 1
+  # A malformed or incomplete policy must not become an apparently valid off.
+  # The UPower bitmask tells us which thresholds this battery should expose.
+  if (( ($2 & 1) != 0 )) && [[ -z $start ]]; then return 0; fi
+  if (( ($2 & 2) != 0 )) && [[ -z $end ]]; then return 0; fi
+  [[ -z $start ]] || percentage "$start" || return 0
+  [[ -z $end ]] || percentage "$end" || return 0
+  [[ -n $start || -n $end ]] || return 0
+  if [[ -n $start && -n $end ]]; then
+    (( start < end )) || return 0
+    kernel_policy="$start-$end"
+  elif [[ -n $end ]]; then
+    kernel_policy=$end
+  fi
+  kernel_state=disabled
+  if { [[ -n $start ]] && (( start > 0 )); } || { [[ -n $end ]] && (( end < 100 )); }; then
+    kernel_state=enabled
+  fi
 }
 
 # A failed query is not evidence that the hardware lacks support. Read the
@@ -42,7 +143,7 @@ upower_property() {
 devices=$(upower -e 2>/dev/null) || status_unavailable
 
 declare -a batteries=()
-enabled=true
+state=unsupported
 policy=unknown
 
 while IFS= read -r device; do
@@ -52,41 +153,61 @@ while IFS= read -r device; do
 
   batteries+=("$device")
   device_enabled=$(upower_property "$device" ChargeThresholdEnabled) || status_unavailable
-  [[ $device_enabled == true ]] || enabled=false
+  [[ $device_enabled == true ]] && device_state=enabled || device_state=disabled
+  device_policy=unknown
 
-  if [[ $policy == unknown ]]; then
-    settings=$(upower_property "$device" ChargeThresholdSettingsSupported) || status_unavailable
-    start=$(upower_property "$device" ChargeStartThreshold) || status_unavailable
-    end=$(upower_property "$device" ChargeEndThreshold) || status_unavailable
+  # Read every supported battery before changing any of them.
+  settings=$(upower_property "$device" ChargeThresholdSettingsSupported) || status_unavailable
+  start=$(upower_property "$device" ChargeStartThreshold) || status_unavailable
+  end=$(upower_property "$device" ChargeEndThreshold) || status_unavailable
 
-    if [[ $settings =~ ^[0-9]+$ ]] && (( (settings & 2) != 0 )) && [[ $end =~ ^[0-9]+$ ]]; then
-      if (( (settings & 1) != 0 )) && [[ $start =~ ^[0-9]+$ ]] && (( start < end )); then
-        policy="$start-$end"
-      else
-        policy="$end"
-      fi
-    elif [[ $settings =~ ^[0-9]+$ ]] && (( (settings & 4) != 0 )); then
-      policy=firmware
+  if (( (settings & 2) != 0 )) && percentage "$end"; then
+    if (( (settings & 1) != 0 )) && percentage "$start" && (( start < end )); then
+      device_policy="$start-$end"
+    else
+      device_policy="$end"
     fi
+  elif (( (settings & 4) != 0 )); then
+    device_policy=firmware
+  fi
+
+  if read_kernel_policy "$device" "$settings"; then
+    device_state=$kernel_state
+    # When off, keep UPower's proposed policy for the next enable operation.
+    if [[ $device_state != disabled ]]; then device_policy=$kernel_policy; fi
+  fi
+
+  if (( ${#batteries[@]} == 1 )); then
+    state=$device_state
+    policy=$device_policy
+  else
+    if [[ $state == unknown || $device_state == unknown ]]; then
+      state=unknown
+    elif [[ $state != "$device_state" ]]; then
+      state=mixed
+    fi
+    [[ $policy == "$device_policy" ]] || policy=multiple
   fi
 done <<<"$devices"
 
-if (( ${#batteries[@]} == 0 )); then
-  state=unsupported
-elif [[ $enabled == true ]]; then
-  state=enabled
-else
-  state=disabled
-fi
+access=unknown
+[[ $state == unsupported ]] || check_access
 
 if [[ $action == status ]]; then
   if [[ $shell_output == true ]]; then
-    printf 'state\t%s\npolicy\t%s\n' "$state" "$policy"
+    printf 'state\t%s\npolicy\t%s\naccess\t%s\n' "$state" "$policy" "$access"
   else
     case "$state" in
       unsupported) echo "Battery protection is not supported" ;;
       enabled) echo "Battery protection is enabled" ;;
       disabled) echo "Battery protection is disabled" ;;
+      mixed) echo "Battery protection is enabled for some batteries" ;;
+      unknown) echo "The current battery protection state is unknown" ;;
+    esac
+    case "$access" in
+      denied) echo "System policy prevents changes to battery protection" ;;
+      challenge) echo "Authentication is required to change battery protection" ;;
+      unknown) [[ $state == unsupported ]] || echo "Permission to change battery protection is unavailable" ;;
     esac
   fi
   exit 0
@@ -96,6 +217,27 @@ if [[ $state == unsupported ]]; then
   echo "Battery charge limits are not supported by UPower on this system" >&2
   exit 1
 fi
+
+if [[ $state == unknown ]]; then
+  echo "The current battery protection state is unknown; no changes were made" >&2
+  exit 7
+fi
+
+case "$access" in
+  denied)
+    echo "System policy prevents changes to battery protection" >&2
+    exit 3 ;;
+  unknown)
+    echo "Permission to change battery protection is unavailable; try again" >&2
+    exit 5 ;;
+  challenge)
+    # Authentication is only allowed after an explicit enable/disable request.
+    if ! pkcheck --action-id org.freedesktop.UPower.enable-charging-limit \
+      --process "$auth_subject" --allow-user-interaction; then
+      echo "Authentication was not completed; no changes were made" >&2
+      exit 4
+    fi ;;
+esac
 
 [[ $action == enable ]] && desired=true || desired=false
 failed=false
@@ -107,5 +249,13 @@ for device in "${batteries[@]}"; do
   fi
 done
 
-[[ $failed == false ]] || exit 1
+# Distinguish a failed write from unavailable status or denied permission.
+# A write can fail after another battery changed, so the UI must refresh.
+if [[ $failed == true ]]; then
+  if bios_admin_password_enabled; then
+    echo "A BIOS administrator password is enabled and may be blocking this change" >&2
+    exit 8
+  fi
+  exit 6
+fi
 echo "Battery protection ${action}d"

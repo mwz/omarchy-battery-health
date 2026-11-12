@@ -14,7 +14,7 @@ Panel {
   // permits — needed for the togglePercentage method below.
   manageIpc: false
   property var batteryInfo: ({})
-  property var limitInfo: ({ state: "unavailable", policy: "unknown", stale: true })
+  property var limitInfo: ({ state: "unavailable", policy: "unknown", access: "unknown", stale: true })
   property var systemInfo: ({})
   property var profiles: []
   property string activeProfile: ""
@@ -22,9 +22,12 @@ Panel {
   property bool cursorActive: false
   property string cursorSection: "profiles"
   property string limitError: ""
+  property bool limitRefreshPending: false
+  property int limitRevision: 0
   readonly property bool limitVisible: limitInfo.stale || limitInfo.state !== "unsupported"
-  readonly property bool limitAvailable: !limitInfo.stale && (limitInfo.state === "enabled" || limitInfo.state === "disabled")
+  readonly property bool limitAvailable: Model.limitEditable(limitInfo) && !limitRefreshPending
   readonly property string limitDescription: Model.limitStatusDescription(limitInfo)
+  readonly property string limitNote: Model.limitAccessDescription(limitInfo)
   readonly property string limitCommand: decodeURIComponent(String(Qt.resolvedUrl("bin/omarchy-battery-limit")).replace(/^file:\/\//, ""))
   readonly property bool showPercentage: setting("showPercentage", false) === true
   // With the percentage shown the button paints a text block wider than an
@@ -68,14 +71,24 @@ Panel {
     return Model.profileIcon(name)
   }
 
+  function cursorSections() {
+    return limitAvailable ? ["limit", "profiles"] : ["profiles"]
+  }
+
   function moveCursor(dx, dy) {
     if (!cursorActive) {
       cursorActive = true
       return
     }
 
-    if (limitVisible && ((cursorSection === "limit" && dy > 0) || (cursorSection === "profiles" && dy < 0))) {
-      cursorSection = cursorSection === "limit" ? "profiles" : "limit"
+    var sections = cursorSections()
+    var index = sections.indexOf(cursorSection)
+    if (index < 0) {
+      cursorSection = sections[0]
+      return
+    }
+    if (dy !== 0 && index + dy >= 0 && index + dy < sections.length) {
+      cursorSection = sections[index + dy]
       return
     }
 
@@ -95,6 +108,10 @@ Panel {
   function setLimit(action) {
     if (!limitAvailable || !action || !limitCommand || limitActionProc.running) return
     limitError = ""
+    // Discard any status query that started before this write. The next query
+    // must finish before the toggle becomes available again.
+    limitRefreshPending = true
+    limitRevision++
     limitActionProc.command = [limitCommand, action]
     limitActionProc.running = true
   }
@@ -180,7 +197,10 @@ Panel {
   }
 
   function refreshLimit() {
-    if (batteryPresent && !limitProc.running) limitProc.running = true
+    if (batteryPresent && !limitProc.running && !limitActionProc.running) {
+      limitProc.revision = limitRevision
+      limitProc.running = true
+    }
   }
 
   function updateKeyValue(raw, targetName) {
@@ -194,8 +214,9 @@ Panel {
 
   function updateLimitStatus(raw, exitCode) {
     limitInfo = Model.parseLimitStatus(raw, limitInfo, exitCode)
-    if (!cursorActive || (!limitVisible && cursorSection === "limit"))
-      cursorSection = limitVisible ? "limit" : "profiles"
+    var sections = cursorSections()
+    if (!cursorActive || sections.indexOf(cursorSection) < 0)
+      cursorSection = sections[0]
   }
 
   function updateProfiles(raw) {
@@ -245,7 +266,7 @@ Panel {
       var idx = profiles.indexOf(activeProfile)
       profileIndex = idx >= 0 ? idx : 0
       cursorActive = false
-      cursorSection = limitVisible ? "limit" : "profiles"
+      cursorSection = cursorSections()[0]
     }
   }
 
@@ -263,9 +284,18 @@ Panel {
 
   Process {
     id: limitProc
+    property int revision: -1
     command: root.limitCommand ? [root.limitCommand, "status", "--shell"] : []
     stdout: StdioCollector { id: limitOutput; waitForEnd: true }
-    onExited: function(exitCode) { root.updateLimitStatus(limitOutput.text, exitCode) }
+    onExited: function(exitCode, exitStatus) {
+      if (revision !== root.limitRevision || limitActionProc.running) {
+        root.refreshLimit()
+        return
+      }
+      root.limitRefreshPending = false
+      // QProcess::NormalExit is 0; a crash must not count as a valid read.
+      root.updateLimitStatus(limitOutput.text, exitStatus === 0 ? exitCode : -1)
+    }
   }
 
   Process {
@@ -287,16 +317,11 @@ Panel {
 
   Process {
     id: limitActionProc
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var message = text.trim()
-        if (message !== "") root.limitError = message
-      }
-    }
-    onExited: function(exitCode) {
-      if (exitCode === 0) root.limitError = ""
-      else if (root.limitError === "") root.limitError = "Could not update battery protection"
+    stderr: StdioCollector { id: limitActionDetails; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      var result = exitStatus === 0 ? exitCode : -1
+      root.limitError = Model.limitActionError(result)
+      if (result !== 0) console.warn("Battery protection change failed:", limitActionDetails.text.trim())
       root.refresh()
     }
   }
@@ -556,9 +581,9 @@ Panel {
 
           // Keep the explanation readable while the control itself is dimmed.
           Text {
-            visible: root.limitInfo.stale
+            visible: root.limitNote !== ""
             width: parent.width
-            text: root.limitDescription
+            text: root.limitNote
             textFormat: Text.PlainText
             color: root.bar.foreground
             font.family: root.bar.fontFamily
@@ -570,7 +595,8 @@ Panel {
             visible: root.limitError !== ""
             width: parent.width
             text: root.limitError
-            color: Color.urgent
+            textFormat: Text.PlainText
+            color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap

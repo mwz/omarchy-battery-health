@@ -40,10 +40,41 @@ and disables the toggle. It labels any previous state as the last known state.
 The plugin retries every five seconds while the panel is open and restores the
 control after a successful query.
 
+The protection state and permission to change it are separate. A system policy
+can prevent changes while protection remains on. The plugin keeps the current
+state visible, disables the toggle, and explains the restriction. It also
+disables changes when the permission check fails, then retries the check.
+
+The plugin checks permission through Polkit without asking for authentication
+when you open the panel. If authentication is required, clicking the toggle
+requests it through the desktop authentication agent. Cancelling leaves the
+charging policy unchanged.
+
+Where the kernel exposes a recognised charging mode or charge thresholds, the
+plugin reads them to show the current policy. This can correct a stale UPower
+enabled flag after a failed write. Other systems use UPower as the fallback.
+An unfamiliar charging mode shows an unknown state and disables changes.
+
+Permission to request a change does not guarantee that the firmware accepts it.
+If a change fails, the plugin explains the failure and refreshes the state.
+When changes are available, you can use the toggle again. The next click
+follows the refreshed state, including after a partial change on a system with
+several batteries. Detailed errors remain in the shell log and the helper's
+terminal output.
+
+The plugin does not test access by writing values or infer a charging lock
+from the presence of a BIOS password. Some firmware failures have no specific
+reason in the UPower response. After a failed write, it checks the shared Linux
+firmware-attributes interface for an enabled BIOS administrator password.
+If it finds one, the error explains that the password may be blocking the change.
+This hint does not disable the toggle. Missing or unreadable password status
+keeps the generic error message.
+
 ## Compatibility
 
 Requires an Omarchy version with shell plugin support, plus `upower` and
-`busctl`. Those are part of a normal Omarchy installation.
+`busctl`, Polkit's `pkcheck`, and Coreutils' `timeout`. These are part of a
+normal Omarchy installation.
 
 Actual support depends on the laptop firmware, kernel driver, and UPower. The
 plugin uses UPower's D-Bus API and does not use `sudo` or `pkexec`.

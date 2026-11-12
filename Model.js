@@ -40,26 +40,62 @@ function parseProfiles(raw, previousIndex) {
 
 function parseLimitStatus(raw, previous, exitCode) {
   var next = parseKeyValue(raw)
-  if (exitCode === 0 && (next.state === "enabled" || next.state === "disabled" || next.state === "unsupported") && next.policy) {
-    return { state: next.state, policy: next.policy, stale: false }
+  var states = ["enabled", "disabled", "mixed", "unknown", "unsupported"]
+  var policies = /^(unknown|firmware|multiple|(?:100|[1-9]?[0-9])(?:-(?:100|[1-9]?[0-9]))?)$/
+  if (exitCode === 0 && states.indexOf(next.state) >= 0 && policies.test(next.policy || "")) {
+    var access = ["allowed", "challenge", "denied"].indexOf(next.access) >= 0 ? next.access : "unknown"
+    return { state: next.state, policy: next.policy, access: access, stale: false }
   }
 
   // Retain the last known state for display, but never treat it as current.
   var last = previous || {}
-  return { state: last.state || "unavailable", policy: last.policy || "unknown", stale: true }
+  return { state: last.state || "unavailable", policy: last.policy || "unknown", access: "unknown", stale: true }
+}
+
+function limitEditable(info) {
+  return !info.stale
+    && ["enabled", "disabled", "mixed"].indexOf(info.state) >= 0
+    && (info.access === "allowed" || info.access === "challenge")
+}
+
+function limitAccessDescription(info) {
+  if (info.stale) return limitStatusDescription(info)
+  if (info.state === "unsupported") return ""
+  if (info.state === "unknown") return "The current charging policy does not identify whether battery protection is on. Changes are unavailable."
+  if (info.access === "denied") return "System policy prevents changes to battery protection."
+  if (info.access === "challenge") return "Authentication is required to change battery protection."
+  if (info.access !== "allowed") return "Permission to change battery protection is unavailable. Retrying…"
+  return ""
+}
+
+function limitActionError(exitCode) {
+  switch (exitCode) {
+    case 0: return ""
+    case 1: return "Battery protection status is unavailable. No changes were made."
+    case 3: return "System policy prevented changes to battery protection."
+    case 4: return "Authentication was not completed. No changes were made."
+    case 5: return "Permission to change battery protection is unavailable. No changes were made."
+    case 7: return "The current battery protection state is unknown. No changes were made."
+    case 8: return "Could not change battery protection. A BIOS administrator password is enabled and may be blocking this change."
+    default: return "UPower could not apply the charge limits. The cause is unknown."
+  }
 }
 
 function limitStatusDescription(info) {
   if (info.stale) {
     var last = info.state === "enabled" ? " Last known state: on."
-      : info.state === "disabled" ? " Last known state: off." : ""
+      : info.state === "disabled" ? " Last known state: off."
+      : info.state === "mixed" ? " Last known state: on for some batteries." : ""
     return "Battery protection status unavailable." + last + " Retrying…"
   }
   return limitDescription(info.state, info.policy)
 }
 
 function limitDescription(state, policy) {
+  if (state === "unknown") return "Protection status unknown"
+  if (state === "mixed") return "Protection is enabled for some batteries"
   var active = state === "enabled"
+  if (policy === "multiple") return (active ? "Uses" : "Use") + " each battery's configured charging policy"
   if (policy === "firmware") return (active ? "Uses" : "Use") + " firmware optimized charging"
   if (!policy || policy === "unknown") return (active ? "Uses" : "Use") + " the battery's health-preserving policy"
 
@@ -130,6 +166,9 @@ if (typeof module !== "undefined") {
     parseKeyValue: parseKeyValue,
     parseProfiles: parseProfiles,
     parseLimitStatus: parseLimitStatus,
+    limitEditable: limitEditable,
+    limitAccessDescription: limitAccessDescription,
+    limitActionError: limitActionError,
     limitStatusDescription: limitStatusDescription,
     limitDescription: limitDescription,
     profileIcon: profileIcon,
